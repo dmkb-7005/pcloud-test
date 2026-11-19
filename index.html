@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#1A1F2B">
+<title>PassMan · pCloud API test</title>
+<style>
+  :root {
+    --bg:#1A1F2B; --surface:#232A39; --surface-2:#2A3242; --border:#343D50;
+    --text:#E6EAF2; --text-2:#B4BCCA; --muted:#9AA3B5;
+    --accent:#3D9BFF; --on-accent:#0B1A2E;
+    --positive:#5FD4A0; --positive-bg:#1D3A35; --warn:#F2B34B; --warn-bg:#3A3222;
+    --danger:#FF8A90; --danger-bg:#2A2430; --info-bg:#1F2D45;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width:560px; margin:0 auto; padding:16px 16px calc(32px + env(safe-area-inset-bottom)); }
+  h1 { font-size:22px; margin:8px 0 4px; }
+  h2 { font-size:13px; font-weight:600; color:var(--muted); margin:0 0 8px; text-transform:uppercase; letter-spacing:.04em; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:20px; padding:16px; margin:12px 0; }
+  .note { background:var(--info-bg); color:var(--text-2); border-radius:14px; padding:12px 14px; font-size:14px; }
+  .muted { color:var(--muted); font-size:13px; }
+  label { display:block; font-size:13px; color:var(--muted); }
+  input { width:100%; margin-top:6px; height:48px; padding:0 14px; border-radius:14px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); font-size:15px; }
+  input:focus { outline:2px solid var(--accent); outline-offset:1px; }
+  code { font-family:ui-monospace, Consolas, monospace; font-size:12.5px; color:var(--text-2); word-break:break-all; }
+  .buttons { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  button { min-height:48px; padding:0 18px; border-radius:24px; border:0; font-size:15px; font-weight:600; cursor:pointer; background:var(--accent); color:var(--on-accent); }
+  button.secondary { background:var(--surface-2); color:var(--text); border:1px solid var(--border); }
+  button.danger { background:var(--danger-bg); color:var(--danger); border:1px solid #5A3038; }
+  button:disabled { opacity:.5; cursor:default; }
+  ol#testLog { list-style:none; margin:0; padding:0; }
+  ol#testLog li { padding:8px 10px; border-radius:12px; margin:6px 0; font-size:14px; }
+  ol#testLog li.pass { background:var(--positive-bg); }
+  ol#testLog li.fail { background:var(--danger-bg); }
+  ol#testLog li.warn { background:var(--warn-bg); }
+  ol#testLog li.info { background:var(--surface-2); }
+  .tag { font-weight:700; margin-right:6px; }
+  li.pass .tag { color:var(--positive); } li.fail .tag { color:var(--danger); }
+  li.warn .tag { color:var(--warn); } li.info .tag { color:var(--muted); }
+  pre { margin:6px 0 0; white-space:pre-wrap; word-break:break-all; font:12px/1.4 ui-monospace, Consolas, monospace; color:var(--text-2); }
+</style>
+</head>
+<body>
+<main>
+  <h1>pCloud API test</h1>
+  <p class="note">Throwaway page for PassMan. It signs in to pCloud from the browser, then uploads, downloads and overwrites a random test file in <code>/PassManTest</code>. No real data is used. The sign-in token is kept in this browser's local storage, so press <b>Forget token</b> when you're done.</p>
+
+  <section class="card">
+    <h2>1 · Sign in</h2>
+    <label>pCloud app Client ID
+      <input id="clientId" autocomplete="off" spellcheck="false" placeholder="from your pCloud app settings">
+    </label>
+    <p class="muted">Redirect URI to register in the pCloud app: <code id="redirectUri"></code></p>
+    <div class="buttons">
+      <button id="signIn">Sign in with pCloud</button>
+      <button id="forget" class="secondary">Forget token</button>
+    </div>
+    <p id="status" class="muted"></p>
+  </section>
+
+  <section class="card">
+    <h2>2 · Tests</h2>
+    <div class="buttons">
+      <button id="runAll">Run all tests</button>
+      <button id="ping" class="secondary">Token still valid?</button>
+      <button id="cleanup" class="danger">Delete test folder</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Log</h2>
+    <ol id="testLog"></ol>
+    <div class="buttons">
+      <button id="copyLog" class="secondary">Copy log</button>
+      <button id="clearLog" class="secondary">Clear log</button>
+    </div>
+  </section>
+</main>
+
+<script>
+'use strict';
+
+const STORE_KEY = 'passman-pcloud-test';
+const OAUTH_STATE_KEY = 'passman-pcloud-oauth-state';
+const TEST_FOLDER = '/PassManTest';
+const TEST_FILE = 'test.vault';
+const TEST_BYTES = 64 * 1024;
+const redirectUri = location.origin + location.pathname;
+const $ = (id) => document.getElementById(id);
+
+// ---------- persistence (test only) ----------
+function loadState() {
+  try { return JSON.parse(localStorage.getItem(STORE_KEY) || '{}'); } catch { return {}; }
+}
+function saveState() {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch { /* ignore */ }
+}
+let state = loadState();
+
+// ---------- logging ----------
+const SECRET_KEYS = new Set(['access_token', 'auth', 'token']);
+function redact(value) {
+  return JSON.stringify(value, (k, v) => (SECRET_KEYS.has(k) ? '[redacted]' : v), 2);
+}
+function log(kind, message, detail) {
+  const li = document.createElement('li');
+  li.className = kind;
+  const tag = document.createElement('span');
+  tag.className = 'tag';
+  tag.textContent = kind.toUpperCase();
+  li.append(tag, document.createTextNode(message));
+  if (detail !== undefined) {
+    const pre = document.createElement('pre');
+    pre.textContent = typeof detail === 'string' ? detail : redact(detail);
+    li.append(pre);
+  }
+  $('testLog').append(li);
+  li.scrollIntoView({ block: 'nearest' });
+}
+
+// ---------- helpers ----------
+class BlockedError extends Error {}
+
+async function sha256Hex(buffer) {
+  const digest = await crypto.subtle.digest('SHA-256', buffer);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+function randomBytes(n) {
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i += 65536) crypto.getRandomValues(out.subarray(i, Math.min(n, i + 65536)));
+  return out;
+}
+function daysSince(iso) {
+  return Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+}
+
+/** Calls a pCloud API method. Throws BlockedError when the browser blocks the request (CORS / network). */
+async function api(method, params = {}, { body, bearer = false } = {}) {
+  if (!state.token || !state.host) throw new Error('Not signed in');
+  const url = new URL(`https://${state.host}/${method}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
+  const init = { method: body ? 'POST' : 'GET', body, cache: 'no-store' };
+  if (bearer) init.headers = { Authorization: `Bearer ${state.token}` };
+  else url.searchParams.set('access_token', state.token);
+  let response;
+  try {
+    response = await fetch(url, init);
+  } catch (err) {
+    throw new BlockedError(`${method}: request blocked by the browser (CORS) or network error — ${err.message}`);
+  }
+  const json = await response.json();
+  return json;
+}
+function ok(json) { return json && json.result === 0; }
+function apiError(json) { return `result ${json?.result}: ${json?.error ?? 'unknown error'}`; }
+
+// ---------- sign-in ----------
+function handleRedirect() {
+  if (!location.hash) return;
+  const p = new URLSearchParams(location.hash.slice(1));
+  if (!p.has('access_token') && !p.has('error')) return;
+  history.replaceState(null, '', redirectUri);
+
+  if (p.has('error')) {
+    log('fail', 'Sign-in returned an error', `${p.get('error')} ${p.get('error_description') ?? ''}`);
+    return;
+  }
+  const expected = sessionStorage.getItem(OAUTH_STATE_KEY);
+  sessionStorage.removeItem(OAUTH_STATE_KEY);
+  if (!expected || p.get('state') !== expected) {
+    log('fail', 'State mismatch: token ignored (possible forged redirect)');
+    return;
+  }
+  state.token = p.get('access_token');
+  state.locationid = p.get('locationid');
+  state.host = p.get('hostname') || (state.locationid === '2' ? 'eapi.pcloud.com' : 'api.pcloud.com');
+  state.issuedAt = new Date().toISOString();
+  saveState();
+  log('pass', 'Signed in (token flow)', {
+    hostname: state.host,
+    locationid: state.locationid,
+    parametersReturned: [...p.keys()],
+    expires_in: p.get('expires_in') ?? 'not provided → token lifetime unknown',
+  });
+}
+
+function renderStatus() {
+  $('clientId').value = state.clientId ?? '';
+  $('redirectUri').textContent = redirectUri;
+  if (state.token) {
+    const age = daysSince(state.issuedAt);
+    $('status').textContent = `Signed in ${age === 0 ? 'today' : age + ' day(s) ago'} · API host ${state.host}`;
+  } else {
+    $('status').textContent = 'Not signed in.';
+  }
+  for (const id of ['runAll', 'ping', 'cleanup']) $(id).disabled = !state.token;
+}
+
+$('signIn').addEventListener('click', () => {
+  const clientId = $('clientId').value.trim();
+  if (!clientId) { log('fail', 'Enter the Client ID first'); return; }
+  state.clientId = clientId;
+  saveState();
+  const oauthState = crypto.randomUUID();
+  sessionStorage.setItem(OAUTH_STATE_KEY, oauthState);
+  const url = new URL('https://my.pcloud.com/oauth2/authorize');
+  url.search = new URLSearchParams({
+    client_id: clientId,
+    response_type: 'token',
+    redirect_uri: redirectUri,
+    state: oauthState,
+  }).toString();
+  location.assign(url.toString());
+});
+
+$('forget').addEventListener('click', () => {
+  delete state.token; delete state.host; delete state.locationid; delete state.issuedAt; delete state.folderId;
+  saveState();
+  renderStatus();
+  log('info', 'Token removed from this browser. To revoke it completely, remove the app in your pCloud account settings.');
+});
+
+// ---------- tests ----------
+async function testUserinfo() {
+  const json = await api('userinfo');
+  if (!ok(json)) throw new Error(`userinfo failed: ${apiError(json)}`);
+  log('pass', 'API call from the browser works (token in query string)', {
+    host: state.host,
+    premium: json.premium,
+    quotaGB: Math.round((json.quota ?? 0) / 1e9),
+  });
+}
+
+async function testBearerHeader() {
+  try {
+    const json = await api('userinfo', {}, { bearer: true });
+    if (ok(json)) log('pass', 'Authorization: Bearer header accepted (token can stay out of URLs)');
+    else log('warn', 'Preflight allowed, but the Bearer header was not accepted: tokens must go in the URL', apiError(json));
+  } catch (err) {
+    if (err instanceof BlockedError) log('warn', 'Bearer header blocked (CORS preflight not allowed): tokens must go in the URL', err.message);
+    else throw err;
+  }
+}
+
+async function testFolder() {
+  const json = await api('createfolderifnotexists', { path: TEST_FOLDER });
+  if (ok(json)) {
+    state.folderId = json.metadata.folderid;
+    saveState();
+    log('pass', `Folder ${TEST_FOLDER} ready`, { folderid: state.folderId, created: json.created });
+    return;
+  }
+  log('warn', `Could not use path ${TEST_FOLDER}; trying the app's root folder (folderid 0)`, apiError(json));
+  const root = await api('listfolder', { folderid: 0 });
+  if (!ok(root)) throw new Error(`listfolder 0 failed: ${apiError(root)}`);
+  state.folderId = 0;
+  saveState();
+  log('info', 'Using folderid 0', { rootName: root.metadata?.name, path: root.metadata?.path });
+}
+
+async function upload(label) {
+  const bytes = randomBytes(TEST_BYTES);
+  const hash = await sha256Hex(bytes);
+  const form = new FormData();
+  form.append('file', new Blob([bytes], { type: 'application/octet-stream' }), TEST_FILE);
+  const json = await api('uploadfile', { folderid: state.folderId, nopartial: 1 }, { body: form });
+  if (!ok(json)) throw new Error(`${label} failed: ${apiError(json)}`);
+  const meta = json.metadata?.[0];
+  log('pass', `${label}: uploaded ${TEST_BYTES / 1024} KiB`, {
+    fileid: meta?.fileid, name: meta?.name, size: meta?.size, modified: meta?.modified, pcloudHash: meta?.hash, sha256: hash,
+  });
+  return { fileid: meta?.fileid, sha256: hash, meta };
+}
+
+async function download(fileid, expectedSha, label) {
+  const link = await api('getfilelink', { fileid, forcedownload: 1 });
+  if (!ok(link)) throw new Error(`getfilelink failed: ${apiError(link)}`);
+  const url = `https://${link.hosts[0]}${link.path}`;
+  let response;
+  try {
+    response = await fetch(url, { cache: 'no-store' });
+  } catch (err) {
+    throw new BlockedError(`${label}: download host ${link.hosts[0]} blocked by the browser (CORS) — ${err.message}`);
+  }
+  if (!response.ok) throw new Error(`${label}: download HTTP ${response.status}`);
+  const buffer = await response.arrayBuffer();
+  const got = await sha256Hex(buffer);
+  if (got === expectedSha) log('pass', `${label}: downloaded and the content matches`, { downloadHost: link.hosts[0] });
+  else log('fail', `${label}: content differs from what was uploaded (stale copy?)`, { expected: expectedSha, got });
+}
+
+async function testOverwrite(first) {
+  const second = await upload('Upload #2 (same name)');
+  if (second.fileid === first.fileid) log('pass', 'Overwrite keeps the same fileid (file replaced in place)');
+  else log('warn', 'Second upload got a new fileid', { first: first.fileid, second: second.fileid, name: second.meta?.name });
+
+  const list = await api('listfolder', { folderid: state.folderId });
+  if (!ok(list)) throw new Error(`listfolder failed: ${apiError(list)}`);
+  const names = (list.metadata?.contents ?? []).map((c) => c.name);
+  const copies = names.filter((n) => n.startsWith('test'));
+  if (copies.length === 1) log('pass', 'Folder holds one test file: no duplicate copies created', names);
+  else log('warn', 'Folder holds several test files (renamed copies?)', names);
+  return second;
+}
+
+async function testStat(fileid) {
+  const json = await api('stat', { fileid });
+  if (!ok(json)) throw new Error(`stat failed: ${apiError(json)}`);
+  log('pass', 'File metadata available for change detection', {
+    modified: json.metadata.modified, size: json.metadata.size, pcloudHash: json.metadata.hash,
+  });
+}
+
+async function runAll() {
+  $('runAll').disabled = true;
+  log('info', `Run started · ${navigator.userAgent}`);
+  try {
+    await testUserinfo();
+    await testBearerHeader();
+    await testFolder();
+    const first = await upload('Upload #1');
+    await download(first.fileid, first.sha256, 'Download #1');
+    const second = await testOverwrite(first);
+    await download(second.fileid, second.sha256, 'Download #2 (after overwrite)');
+    await testStat(second.fileid);
+    log('info', 'Run finished.');
+  } catch (err) {
+    log('fail', err instanceof BlockedError ? 'Blocked' : 'Stopped', err.message);
+  } finally {
+    $('runAll').disabled = !state.token;
+  }
+}
+
+$('runAll').addEventListener('click', runAll);
+
+$('ping').addEventListener('click', async () => {
+  try {
+    const json = await api('userinfo');
+    const age = daysSince(state.issuedAt);
+    if (ok(json)) log('pass', `Token still valid after ${age} day(s)`);
+    else log('fail', `Token rejected after ${age} day(s)`, apiError(json));
+  } catch (err) {
+    log('fail', 'Check failed', err.message);
+  }
+});
+
+$('cleanup').addEventListener('click', async () => {
+  try {
+    if (state.folderId === undefined || state.folderId === 0) {
+      log('info', 'No dedicated test folder recorded. Delete test.vault by hand if needed.');
+      return;
+    }
+    const json = await api('deletefolderrecursive', { folderid: state.folderId });
+    if (ok(json)) { log('pass', `Deleted ${TEST_FOLDER}`); delete state.folderId; saveState(); }
+    else log('fail', 'Delete failed', apiError(json));
+  } catch (err) {
+    log('fail', 'Delete failed', err.message);
+  }
+});
+
+$('copyLog').addEventListener('click', async () => {
+  const text = [...$('testLog').children].map((li) => li.innerText).join('\n\n');
+  try { await navigator.clipboard.writeText(text); log('info', 'Log copied to clipboard'); }
+  catch { log('warn', 'Clipboard not available: select the log and copy it by hand'); }
+});
+$('clearLog').addEventListener('click', () => { $('testLog').replaceChildren(); });
+
+handleRedirect();
+renderStatus();
+</script>
+</body>
+</html>
