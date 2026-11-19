@@ -1,0 +1,12 @@
+node_modules/
+dist/
+dev-dist/
+*.local
+.DS_Store
+
+# personal data: never commit (the repo is public)
+legacy-data/*
+!legacy-data/.gitkeep
+*-backup-*.json
+*-backup-*.json.txt
+*.csv
